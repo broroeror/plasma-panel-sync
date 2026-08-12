@@ -1,0 +1,16 @@
+[Unit]
+Description=Keep matching Plasma panels in sync across screens
+PartOf=graphical-session.target
+After=plasma-plasmashell.service
+Requisite=plasma-plasmashell.service
+
+[Service]
+Type=simple
+ExecStart=%h/Documents/Programming/plasma-panel-sync/panelsync.py watch
+Restart=on-failure
+RestartSec=5
+# Give plasmashell time to register on the session bus after a restart
+ExecStartPre=/usr/bin/sleep 3
+
+[Install]
+WantedBy=plasma-workspace.target
