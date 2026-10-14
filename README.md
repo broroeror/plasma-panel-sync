@@ -34,29 +34,37 @@ master and is pushed to its siblings.
 If it can't tell — no snapshot yet, or several panels changed at once — it
 refuses to guess and asks you to pass `--master <id>`. It never picks arbitrarily.
 
+## Installing
+
+On Arch, build and install the package from the `packaging/` folder:
+
+```bash
+cd packaging
+makepkg -si
+systemctl --user enable --now plasma-panel-sync.service
+```
+
+The PKGBUILD builds from the repository's committed state, so commit before
+rebuilding. Watch what the background sync does with:
+
+```bash
+journalctl --user -u plasma-panel-sync -f
+```
+
 ## Usage
 
 ```bash
-./panelsync.py status                       # show groups and any drift
-./panelsync.py push --dry-run               # what would happen
-./panelsync.py push --master 99             # force a winner (first reconcile)
-./panelsync.py snapshot                     # record current state as baseline
-./panelsync.py watch                        # auto-sync on change
-./panelsync.py --group bottom status        # limit to one edge
+plasma-panel-sync status                    # show groups and any drift
+plasma-panel-sync push --dry-run            # what would happen
+plasma-panel-sync push --master 99          # force a winner (first reconcile)
+plasma-panel-sync snapshot                  # record current state as baseline
+plasma-panel-sync watch                     # auto-sync on change
+plasma-panel-sync --group bottom status     # limit to one edge
 ```
 
 Panels are grouped by screen edge, so `bottom` is the docks and `top` is the
-menu bars. Groups with only one member are ignored.
-
-## Running it in the background
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp plasma-panel-sync.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now plasma-panel-sync.service
-journalctl --user -u plasma-panel-sync -f
-```
+menu bars. Groups with only one member are ignored. Panel ids come from
+`status`.
 
 The watcher polls the config file's mtime, waits for writes to settle, then
 diffs and pushes. After each push it suppresses itself briefly so its own
@@ -84,11 +92,20 @@ which does flicker briefly.
 
 ## Known limits
 
-- **System tray fidelity.** The tray is a nested container. Its `shownItems` /
-  `hiddenItems` / `extraItems` keys sync fine, and the tray recreates its child
-  applets from those. Deeper per-child configuration is not walked.
+- **System tray.** The tray is a container, and its settings live under the
+  applet itself rather than under `[Configuration]`. Its `hiddenItems` /
+  `shownItems` / `disabledStatusNotifiers` lists sync. Settings of the widgets
+  *inside* the tray (volume, network, ...) are not walked.
+- **Removing a setting.** The scripting API can write a key but never delete
+  it. When the master has dropped a key (Plasma does this when a list is
+  emptied or a value goes back to its default), lists and text are blanked on
+  the other panels, which reads the same. On/off and number settings are left
+  alone and reported, since a blank one may not mean "default": toggle those
+  once by hand on the panel named in the log.
 - **Rebuild ordering.** Rebuilds remove and re-add widgets to force order, since
-  the scripting API offers no direct reorder.
+  the scripting API offers no direct reorder. Untouched panels are addressed
+  by applet id, because `panel.widgets()` lists widgets in creation order, not
+  on-screen order.
 - **Config-file reads.** If plasmashell hasn't flushed a change yet, the watcher
   may act on slightly stale keys. The debounce is there to make that unlikely.
 

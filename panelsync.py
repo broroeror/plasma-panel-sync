@@ -111,19 +111,44 @@ def parse_kconfig(path: Path) -> dict[tuple, dict]:
 
 
 def applet_config(cfg: dict, cid: str, aid: str) -> dict[str, dict]:
-    """Collect an applet's [Configuration][...] groups, minus transient state."""
-    prefix = ("Containments", cid, "Applets", aid, "Configuration")
+    """Collect an applet's settings groups, minus transient state.
+
+    Ordinary applets keep settings under [Applets][N][Configuration][...].
+    Container applets (the system tray) are containments themselves, so theirs
+    sit directly under [Applets][N][General] - that is where the tray's
+    hidden/shown icon lists live. The scripting API addresses both the same way
+    (currentConfigGroup = ["General"]), so they share one namespace here.
+
+    Empty values are dropped: Plasma deletes a list key when it is emptied, and
+    we can only blank keys, never delete them, so "" and absent must compare equal.
+    """
+    base = ("Containments", cid, "Applets", aid)
     out: dict[str, dict] = {}
     for group, kv in cfg.items():
-        if group[:5] != prefix or len(group) < 6:
+        if group[:4] != base or len(group) < 5:
             continue
-        name = "/".join(group[5:])
-        if name in SKIP_GROUPS:
+        if group[4] == "Configuration":
+            parts = group[5:]
+        elif group[4] == "Applets":
+            continue  # nested applets are tracked by nested_plugins()
+        else:
+            parts = group[4:]
+        name = "/".join(parts)
+        if not name or name in SKIP_GROUPS:
             continue
-        cleaned = {k: v for k, v in kv.items() if k not in SKIP_KEYS}
+        cleaned = {k: v for k, v in kv.items() if k not in SKIP_KEYS and v != ""}
         if cleaned:
-            out[name] = cleaned
+            out.setdefault(name, {}).update(cleaned)
     return out
+
+
+def clearable(value: str) -> bool:
+    """Whether blanking a key is a safe stand-in for deleting it.
+
+    A blank list or string reads the same as an unset one. A blank boolean or
+    number does not (it may not be the default), so those are left alone.
+    """
+    return value not in ("true", "false") and not re.fullmatch(r"-?\d+(\.\d+)?", value)
 
 
 def nested_plugins(cfg: dict, cid: str, aid: str) -> list[str]:
@@ -140,7 +165,7 @@ def panel_state(cfg: dict, cid: str) -> dict:
     """The syncable state of one panel containment."""
     order = cfg.get(("Containments", cid, "General"), {}).get("AppletOrder", "")
     aids = [a for a in order.split(";") if a]
-    applets = []
+    applets, ids = [], []
     for aid in aids:
         base = cfg.get(("Containments", cid, "Applets", aid), {})
         plugin = base.get("plugin")
@@ -151,7 +176,9 @@ def panel_state(cfg: dict, cid: str) -> dict:
             "config": applet_config(cfg, cid, aid),
             "nested": nested_plugins(cfg, cid, aid),
         })
-    return {"applets": applets}
+        ids.append(int(aid))
+    # ids are per-panel, so they stay out of the comparison (see signature())
+    return {"applets": applets, "ids": ids}
 
 
 # --------------------------------------------------------------------- policy
@@ -177,7 +204,7 @@ def build_groups(panels: list[dict], only: str | None) -> dict[str, list[dict]]:
 
 
 def signature(state: dict) -> str:
-    return json.dumps(state, sort_keys=True)
+    return json.dumps(state["applets"], sort_keys=True)
 
 
 # ----------------------------------------------------------------------- push
@@ -186,18 +213,50 @@ def js_string(value: str) -> str:
     return json.dumps(value)
 
 
-def build_push_js(target_id: int, master: dict, rebuild: bool) -> str:
+def stale_keys(master: dict, target: dict | None) -> list[tuple[int, str, str, str]]:
+    """Keys a target applet has that its master counterpart does not.
+
+    Returns (applet index, group, key, value). Only meaningful when the widget
+    lists match; after a rebuild the target's old config is gone anyway.
+    """
+    if not target:
+        return []
+    stale = []
+    for index, (m, t) in enumerate(zip(master["applets"], target["applets"])):
+        if m["plugin"] != t["plugin"]:
+            continue
+        for group, kv in t["config"].items():
+            for key, value in kv.items():
+                if key not in m["config"].get(group, {}):
+                    stale.append((index, group, key, value))
+    return stale
+
+
+def build_push_js(target_id: int, master: dict, rebuild: bool,
+                  target_ids: list[int] = (),
+                  clear: list[tuple[int, str, str, str]] = ()) -> str:
+    # p.widgets() lists applets in creation order, NOT on-screen order, so an
+    # untouched panel's widgets are looked up by applet id. Only freshly added
+    # widgets are in a known order (the order we added them).
     lines = [f"var p = panelById({target_id});"]
     if rebuild:
         lines.append("p.widgets().forEach(function (w) { w.remove(); });")
         for applet in master["applets"]:
             lines.append(f"p.addWidget({js_string(applet['plugin'])});")
-    lines.append("var ws = p.widgets();")
+        lines.append("var ws = p.widgets();")
+    else:
+        lines.append("var byId = {};")
+        lines.append("p.widgets().forEach(function (w) { byId[w.id] = w; });")
+        lines.append(f"var ws = {json.dumps(list(target_ids))}.map(function (i) {{ return byId[i]; }});")
     for index, applet in enumerate(master["applets"]):
-        if not applet["config"]:
+        writes = {g: dict(kv) for g, kv in applet["config"].items()}
+        for c_index, group, key, _ in clear:
+            if c_index == index:
+                writes.setdefault(group, {})[key] = ""
+        if not writes:
             continue
         lines.append(f"if (ws[{index}] && ws[{index}].type === {js_string(applet['plugin'])}) {{")
-        for group, kv in applet["config"].items():
+        for group, kv in writes.items():
             parts = ", ".join(js_string(g) for g in group.split("/"))
             lines.append(f"  ws[{index}].currentConfigGroup = [{parts}];")
             for key, value in kv.items():
@@ -209,16 +268,29 @@ def build_push_js(target_id: int, master: dict, rebuild: bool) -> str:
 
 
 def push(master_state: dict, master_id: int, targets: list[dict],
-         dry_run: bool) -> list[str]:
+         states: dict, dry_run: bool) -> list[str]:
     actions = []
     master_plugins = [a["plugin"] for a in master_state["applets"]]
     for target in targets:
-        rebuild = target["widgets"] != master_plugins
+        target_state = states[target["id"]]
+        rebuild = [a["plugin"] for a in target_state["applets"]] != master_plugins
         verb = "rebuild + config" if rebuild else "config only"
         actions.append(f"panel {target['id']} (screen {target['screen']}): {verb}")
+        clear = []
+        if not rebuild:
+            for item in stale_keys(master_state, target_state):
+                index, group, key, value = item
+                widget = master_plugins[index].split(".")[-1]
+                if clearable(value):
+                    clear.append(item)
+                    actions.append(f"  clear {widget} {group}/{key}")
+                else:
+                    actions.append(f"  can't reset {widget} {group}/{key}={value} "
+                                   f"live - toggle it once on panel {target['id']}")
         if dry_run:
             continue
-        evaluate(build_push_js(target["id"], master_state, rebuild))
+        evaluate(build_push_js(target["id"], master_state, rebuild,
+                               target_state["ids"], clear))
     return actions
 
 
@@ -299,7 +371,7 @@ def cmd_push(args) -> int:
         if not targets:
             continue
         print(f"{name}: master = panel {master_id} ({reason})")
-        for action in push(states[master_id], master_id, targets, args.dry_run):
+        for action in push(states[master_id], master_id, targets, states, args.dry_run):
             print(f"  {'would ' if args.dry_run else ''}{action}")
         did_work = True
 

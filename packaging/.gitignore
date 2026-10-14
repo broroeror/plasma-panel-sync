@@ -1,0 +1,4 @@
+pkg/
+src/
+*.pkg.tar.*
+plasma-panel-sync/
